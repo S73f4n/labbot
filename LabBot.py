@@ -26,8 +26,10 @@ import datetime
 import datemath
 import io
 import logging
-import matplotlib.colors
-import matplotlib.pyplot as plt
+import matplotlib
+# Fixes deleted by the wrong thread error
+matplotlib.use('Agg')
+from matplotlib import pyplot as plt
 import numpy as np
 import os
 import pandas as pd
@@ -43,6 +45,14 @@ from telegram.ext import Updater, CommandHandler, MessageHandler, CallbackQueryH
 from telegram import ChatAction
 from collections import deque
 
+# Taner Erwin STM library
+import Entropy as entropy
+import Magnetics as magnetics
+
+# HTTP request for LHe levels
+import requests as req
+from requests.auth import HTTPBasicAuth
+
 # import configuration
 import LabBot_config as cfg
 
@@ -52,6 +62,7 @@ class LabBot:
         self.__version__ = 0.24
 
         self.LOG_last_checked = None     # date and time of when the log was last checked
+        self.LOG_last_checked_magnetics = None
         self.LOG_data = {}               # data of one log line, keys are labels
         self.LOG_labels = []             # labels for log data
         self.LOG_labels_nice = {}        # labels for log data with string replacements (keys are the LOG_labels)
@@ -93,7 +104,7 @@ class LabBot:
 
         button_list = [
             telegram.InlineKeyboardButton("graph", callback_data='/graph'),
-            telegram.InlineKeyboardButton("graph+", callback_data='/graph+'),
+            telegram.InlineKeyboardButton("magnets", callback_data='/graph magnets'),
             telegram.InlineKeyboardButton("notify", callback_data='/n'),
             telegram.InlineKeyboardButton("warnings", callback_data='/warning'),
             telegram.InlineKeyboardButton("status", callback_data='/status'),
@@ -273,11 +284,11 @@ class LabBot:
         if querydata == '/status':
             self.status_sensors(update, context)
         if querydata == '/status+':
-            self.status_sensors(update, context, args=["grad"])
+            self.status_sensors(update, context, args=["all"])
         elif querydata == '/graph':
             self.status_graph(update, context)
-        elif querydata == '/graph+':
-            self.status_graph(update, context, args=["fit"])
+        elif querydata == '/graph magnets':
+            self.status_graph(update, context, args=["magnets"])
         elif querydata == '/bakeout':
             self.status_bakeout(update, context)
         elif querydata == '/photo':
@@ -532,6 +543,20 @@ class LabBot:
             return None
         return df[-1:]
 
+    def get_lhe_levels(self, entity):
+        # resp = req.get('http://192.168.0.254/', auth=HTTPBasicAuth('lm510', 'cmi'))
+        resp = req.get('http://127.0.0.1/LM-510.htm')
+        try:
+            html_text = resp.text.replace(' ', '').replace('\n', '')
+        except ConnectionError:
+            logging.warning('Could not connect to LHe meter.')
+            return None
+        m = re.findall(r'<th>LHe</th><th>(.+?)</th>', html_text)
+        #m = re.findall(r'(.+?) cm', resp.text.rstrip())
+        d = {'Cryostat': [float(m[0].replace('cm', ''))], 'Pump': [float(m[1].replace('cm', ''))]}
+        df = pd.DataFrame(data=d)
+        return df 
+
     @restricted
     @send_action(ChatAction.TYPING)
     def silence_errors(self, update, context, args=[], chat_id=0):
@@ -780,26 +805,23 @@ class LabBot:
     def help_message(self, update, context, chat_id=0):
         """Prints a help message."""
         chat_id = self.get_chat_id(update, chat_id)
-        str_out = 'Ask me for *status updates* using: "status" or "/status" or "s".\n'
-        str_out += '"s 0.5" will display the slopes for the last 0.5 hours.\n\n'
-        str_out += 'Pressure, temperature and logging warnings will be sent every {:d} minutes. '.format(
+        str_out = 'Ask me for *status updates* using: "status" or "s".\n'
+        str_out += 'Temperature and logging warnings, if set up, will be sent every {:d} minutes. '.format(
             cfg.WARNING_SEND_EVERY_MINUTES)
         str_out += 'Use "limits" to see warning limits.\n\n'
         str_out += '*Active warning messages* are shown using /w or "warnings".\n\n'
         str_out += 'The active *warnings can be silenced* for n hours using the command "/silence n".\n'
         str_out += 'n=0 will re-enable normal warnings.\n\n'
-        str_out += '*Graphs* can be plotted using the "graph" keyword or "/graph" and "/g" commands. '
+        str_out += '*Graphs* can be plotted using the "graph" or "g" commands. '
         str_out += 'Extra parameters are possible to specify _from_ and _to_ dates.\n'
         str_out += 'Try: "/g -3d" or "g -12h -10h"\n'
-        str_out += 'Also: "/g 20" or "g 2.5d" will work as short notations.\n'
-        str_out += 'The graph and status commands both support extra arguments'
+        str_out += 'The graph commands support extra arguments\n'
         str_out += 'specifying the sensor data that should be plotted.\n'
-        str_out += '"g afm prep tafm" or "g all".\n\n'
-        str_out += 'You can even do some fits in the graph module: "g tafm fit -0.5 0.5 2" for fitting of the temperature data from 0.5 hours ago to 0.5 hours into the future with a 2nd order polynomial.\n'
-        str_out += 'A shortcut is "g tafm fit 0.5" for the same fit but with an order 1 polynomial as default.\n\n'
+        str_out += 'Short forms for channel names are available, e.g., 1ks is 1K-Stage.\n'
+        str_out += '"g 1ks GGG" for individual channels\n'
+        str_out += '"g all" for all data, "g magnets" for magnetic fields.\n\n'
         str_out += '*User notifications* can be set up using:\n'
-        str_out += '/n afm < 1e-10\n'
-        str_out += 'n afm lt 1e-10\n'
+        str_out += '/n 1ks < 1e-10\n'
         str_out += 'n list\n'
         str_out += 'n t < 10\n'
         str_out += 'n list\n'
@@ -820,7 +842,7 @@ class LabBot:
             to_date = gradient_dates[1]
         else:
             to_date = datetime.datetime.now() + datetime.timedelta(hours=1)  # we want some extra time, just in case
-        data = self.read_logs(from_date=from_date, to_date=to_date)  # read the necessary log files
+        data = self.read_logs(from_date=from_date, to_date=to_date, channels=columns)  # read the necessary log files
         if data is None:
             return gradients
 
@@ -864,11 +886,14 @@ class LabBot:
 
         str_out = error_str
         if self.LOG_last_checked:
-            str_out += "*{}*".format(self.date_format_bot(self.LOG_last_checked))
-        if self.quiet_hours():
-            str_out += ' _(quiet hours)_'
+            str_out += "Last Checked Entropy: *{}*".format(self.date_format_bot(self.LOG_last_checked))
         if 'ERROR_log_read' in self.ERRORS_checks:
             str_out += ' ' + cfg.WARNING_SYMBOL
+        if self.LOG_last_checked_magnetics:
+            str_out += "\nLast Checked Magnetics: *{}*".format(self.date_format_bot(self.LOG_last_checked_magnetics))
+        if self.quiet_hours():
+            str_out += ' _(quiet hours)_'
+        
 
         query_string = ' '.join(args)
         query_string = re.sub(r'[^\w\s\.]', ' ', query_string.replace('-', ''))
@@ -880,6 +905,10 @@ class LabBot:
             # add columns from measure requests as well
             for entity, cm_dict in cfg.MEASURE_REQUESTS.items():
                 columns.append(cm_dict['column'])
+        elif 'helium' in query_items:
+            columns = cfg.HELIUMCHANNELS 
+        elif 'magnets' in query_items:
+            columns = cfg.MAGNETCHANNELS 
         else:
             for q in query_items:
                 c = self.get_column_name(q)
@@ -932,9 +961,9 @@ class LabBot:
                 # check the message requests - here we need to read the log file
                 for entity, cm_dict in cfg.MEASURE_REQUESTS.items():
                     if c == cm_dict['column']:
-                        data = self.measure_getlast(entity)
+                        data = self.get_lhe_levels(entity)
                         if data is not None and data.shape[0] > 0:
-                            date_last_measured = data.tail(1).index.to_pydatetime()[0]
+                            # date_last_measured = data.tail(1).index.to_pydatetime()[0]
                             # if date_last_measured <= m_dict['last_measured']:
                             #     continue  # no new values in the file yet
                             column_name = cfg.MEASURE_REQUESTS[entity]['column']
@@ -945,10 +974,9 @@ class LabBot:
                                 continue
                             value = data.tail(1)[column_name]
                             column_name_nice = cfg.LOG_NAMES_REPLACEMENT(column_name)
-                            str_out += "\n*{}*: {}  _({})_".format(
+                            str_out += "\n*{}*: {}".format(
                                 column_name_nice,
                                 self.replace_lowerthan(value).values[0],
-                                self.date_format_bot(date_last_measured)
                             )
 
         self.bot.send_message(chat_id=chat_id, text=str_out, parse_mode=telegram.ParseMode.MARKDOWN,
@@ -1103,6 +1131,7 @@ class LabBot:
         now = datetime.datetime.now()
         bio = io.BytesIO()
         bio.name = 'AFM_status_graph.png'
+        magnet_plot=False
 
         # default values
         from_date = now - datetime.timedelta(days=cfg.GRAPH_DEFAULT_DAYS)
@@ -1120,6 +1149,10 @@ class LabBot:
         if 'all' in args:
             columns_toplot = self.LOG_labels
             args.remove('all')
+        elif 'magnets' in args:
+            columns_toplot = cfg.MAGNETCHANNELS
+            magnet_plot=True
+            args.remove('magnets')
         else:
             args_to_delete = []
             for i, arg in enumerate(args):
@@ -1177,11 +1210,11 @@ class LabBot:
             from_date_interp, to_date_interp = to_date_interp, from_date_interp
         if order_interp < 1:
             order_interp = cfg.GRAPH_FIT_DEFAULT_ORDER
-
-        data = self.read_logs(from_date=from_date, to_date=to_date)  # read the necessary log files
+        data = self.read_logs(from_date=from_date, to_date=to_date, channels=columns_toplot)  # read the necessary log files
         if data is None:
             self.status_graph_no_data(update, context, args=args, chat_id=chat_id, from_date=from_date, to_date=to_date)
             return False
+        context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_PHOTO)
         # filter date range
         # data = data[from_date:to_date]
         # the slicing causes problems for nonmonotonous data,
@@ -1195,23 +1228,50 @@ class LabBot:
         if not data.shape[0]:
             self.status_graph_no_data(update, context, args=args, chat_id=chat_id, from_date=from_date, to_date=to_date)
             return False
-
+        if magnet_plot:
+            num_subplot = 2
+        else:
+            num_subplot = int(np.ceil((len(columns_toplot)+1)/3))
         fig, axs = plt.subplots(
-            len(columns_toplot), 1, sharex=True,
-            squeeze=False, figsize=(8, 0.5 + 2 * len(columns_toplot))
+            num_subplot, 1, sharex=True,
+            squeeze=False, figsize=(8, 0.5 + 2 * num_subplot)
         )
 
-        # get colors for columns
-        colors = {}
-        for i, c in enumerate(self.LOG_labels):
-            color = plt.cm.tab20(np.linspace(0, 1, len(self.LOG_labels)))[i % len(self.LOG_labels)]
-            colors[c] = matplotlib.colors.rgb2hex(color[0:3])
-        # colors = ['#1b9e77', '#e41a1c', '#d95f02', '#386cb0', '#285ca0']
+        colors = {'1K-Deckel': '#ff7f0e',
+                '1K-Konus': '#ee3377', 
+                '1K-Stage': '#e41a1c', 
+                '4K-Konus': '#555555', 
+                '4K-Stage': '#33bbee', 
+                'FAA': '#1f77b4', 
+                'GGG': '#2ca02c',
+                'ADR': '#CCBB44',
+                'Sample': '#AA3377'}
+        lines = {'1K-Deckel': 'dashed',
+                '1K-Konus': 'dashed', 
+                '1K-Stage': 'solid', 
+                '4K-Konus': 'dashed', 
+                '4K-Stage': 'solid', 
+                'FAA': 'solid', 
+                'GGG': 'solid',
+                'CM4GB': 'solid',
+                'ADR': 'solid',
+                'Sample': 'dashed'}
+
         total_count = 0
+        shift_i = 1
         for i, c in enumerate(columns_toplot):
+            if not magnet_plot:
+                if i == 2:
+                    i = 0
+                    shift_i = 2
+                else:
+                    i = int(np.ceil((i-shift_i)/2))
             # filter non-positive values
             if c in self.LOG_data:
-                axs[i, 0].set_ylabel(self.LOG_labels_nice[c])
+                if c in cfg.TEMPCHANNELS:
+                    axs[i, 0].set_ylabel("T [K]")
+                elif c in cfg.MAGNETCHANNELS:
+                    axs[i, 0].set_ylabel("B [T]")
             axs[i, 0].tick_params(direction='in')
             if c not in data:
                 continue
@@ -1225,9 +1285,11 @@ class LabBot:
             count = data[c].count()
             total_count += count
             if count:
-                data.plot(y=c, ax=axs[i, 0], color=colors[c], ls='-', lw=2, ms=0, legend=None, logy=logy)
+                # data[c] = data[c].ffill()
+                data.plot(y=c, ax=axs[i, 0], color=colors[c], lw=0, ls=None, marker=".", ms=1.5, label=c, logy=logy)
                 axs[i, 0].grid(which="major", alpha=0.3)
                 axs[i, 0].grid(which="minor", alpha=0.1)
+                axs[i,0].legend(loc="upper right",markerscale=1.5, numpoints=10)
 
             # interpolation
             if do_interp and data_interp[c].count():
@@ -1245,15 +1307,15 @@ class LabBot:
                     yfit[yfit <= 0] = np.nan
                 axs[i,0].plot(xplot, yfit, color=colors[c], ls='--', lw=1, ms=0, alpha=0.5, label=None)
 
-        if not total_count:
-            self.status_graph_no_data(update, context, args=args, chat_id=chat_id, from_date=from_date, to_date=to_date)
-            return False
+        # if not total_count:
+        #     self.status_graph_no_data(update, context, args=args, chat_id=chat_id, from_date=from_date, to_date=to_date)
+        #     return False
 
         axs[-1, 0].set_xlabel('')
         fig.autofmt_xdate()
         plt.tight_layout(pad=1.02, w_pad=0, h_pad=0)
         # fig.subplots_adjust(wspace=0, hspace=0)
-        plt.savefig(bio, format='png', dpi=100)
+        plt.savefig(bio, format='png', dpi=150)
         bio.seek(0)
         context.bot.send_photo(chat_id=chat_id, photo=bio, reply_markup=self.reply_markup)
         plt.close()
@@ -1309,10 +1371,10 @@ class LabBot:
             context.bot.send_message(chat_id=update.effective_message.chat_id, text="Last commands not found.",
                 parse_mode=telegram.ParseMode.MARKDOWN, reply_markup=self.reply_markup)
 
-    def read_logs(self, from_date, to_date):
+    def read_logs(self, from_date, to_date, channels):
         """reads logs for the days between from_date and to_date.
         If the number of columns is too big, it will be reduced using rolling averaging."""
-
+        
         if from_date > to_date:
             from_date, to_date = to_date, from_date
 
@@ -1324,29 +1386,34 @@ class LabBot:
             from_date = to_date - datetime.timedelta(days=cfg.GRAPH_DAYS_MAX)
             num_days = cfg.GRAPH_DAYS_MAX
 
+        log_from_date = from_date - datetime.timedelta(days=cfg.LOG_FILE_LOOKBACK_DAYS)
+        
         datas = []
-        # we need to adjust the to_date to get all logs
-        to_date_adjusted = to_date + datetime.timedelta(days=cfg.LOG_FILE_EVERY_DAYS)
-        this_date = from_date
-        while this_date <= to_date_adjusted:
-            log_file = this_date.strftime(cfg.LOG_FILE)
-            try:
-                # we can use skiprows here, but I found that it doesn't really speed up things; so we do the rolling mean in the next line
-                df = pd.read_csv(log_file,
-                                 sep=cfg.LOG_FILE_DELIMITER,
-                                 comment=cfg.LOG_FILE_DELIMITER_COMMENT_SYMBOL,
-                                 parse_dates=True,
-                                 date_parser=self.str2date,
-                                 index_col=0,
-                                 dtype=float)#,
-                                #  on_bad_lines="skip")  # TODO: check if ignoring bad lines does not cause any other errors
-                datas.append(df)
-            except FileNotFoundError:
-                pass
-            this_date += datetime.timedelta(days=cfg.LOG_FILE_EVERY_DAYS)
+        df = None
+        try:
+            for c in channels:
+                if c in cfg.TEMPCHANNELS:
+                    temperatureData1 = entropy.getTemperatureData_bot(cfg.ENTROPY_FOLDER, log_from_date, to_date, c)
+                    df = pd.concat([df, temperatureData1],sort=False)
+                elif c in cfg.MAGNETCHANNELS:
+                    magnetData = magnetics.getMagnetData_bot(cfg.MAGNETICS_FOLDER, log_from_date, to_date, c)
+                    cols = ['Supply Voltage (V)', 'Supply Current (A)', 'Magnet Voltage (V)', 'Magnet Current (A)']
+                    magnetData.drop(cols, axis=1, inplace=True)
+                    magnetData.rename(columns={'Magnetic field (T)': c},inplace=True)
+                    df = pd.concat([df, magnetData],sort=False)
+        except KeyError:
+            pass
+        try:
+            df.set_index('Time', inplace=True)
+            df = df.sort_index()
+        except KeyError:
+            return None
 
+        datas = df[from_date:to_date]
+        # print(datas.shape[0])
         if len(datas) > 0:
-            data = pd.concat(datas, sort=False)
+            # data = pd.concat(datas, sort=False)
+            data = datas
             if data.shape[0] > cfg.GRAPH_MAX_POINTS:
                 n = int(np.ceil(cfg.GRAPH_MAX_POINTS / data.shape[0]))
                 return data.rolling(n).mean().iloc[::n, :]
@@ -1364,29 +1431,35 @@ class LabBot:
         self.log_file = (datetime.datetime.now() - datetime.timedelta(seconds=10)).strftime(cfg.LOG_FILE)
 
         selected_lines = self.get_first_last_from_file(self.log_file, maxLineLength=maxLineLength, default=b"")
-        df = None
+        dftemp = None
+        dfmagnet = None
         try:
-            df = pd.read_csv(io.BytesIO(selected_lines),
-                             sep=cfg.LOG_FILE_DELIMITER,
-                             comment=cfg.LOG_FILE_DELIMITER_COMMENT_SYMBOL,
-                             parse_dates=True,
-                             date_parser=self.str2date,
-                             skiprows=[1],  # 0 are the column headers, 1 is truncated
-                             index_col=0,
-                             dtype=float)#,
-                             #on_bad_lines="skip")
-            log_labels = df.columns.tolist()
+            log_labels = cfg.TEMPCHANNELS+cfg.MAGNETCHANNELS
             log_labels_nice = list(map(cfg.LOG_NAMES_REPLACEMENT, log_labels))
-        except pd.errors.EmptyDataError:
-            logging.warning('No data found in log file {}.'.format(self.log_file))
+            ts = datetime.datetime.now()
+            end_date = ts
+            start_date = ts - datetime.timedelta(days=cfg.LOG_FILE_LOOKBACK_DAYS)
+            dftemp = entropy.getallTemperatures(cfg.ENTROPY_FOLDER, start_date, end_date, cfg.TEMPCHANNELS, [ts])
+            dfmagnet = magnetics.getallMagneticField(cfg.MAGNETICS_FOLDER, start_date, end_date, cfg.MAGNETCHANNELS, [ts])
+            # dftemp['Closest Time'] = pd.to_datetime(dftemp['Closest Time'])
+            # dfmagnet = magnetics.getallMagneticField(cfg.MAGNETICS_FOLDER, start_date, ts, cfg.MAGNETCHANNELS, [ts])
+        except KeyError:
+            logging.warning('No data found in log file between {} and {}.'.format(start_date, end_date))
+            # self.ERRORS_checks['ERROR_log_read'] = [self.get_chat_id(,chat_id=0)]
         finally:
-            if isinstance(df, pd.DataFrame) and df.shape[0] > 0:
+            if isinstance(dftemp, pd.DataFrame) and dftemp.shape[0] > 0:
                 self.LOG_labels = log_labels
                 self.LOG_labels_nice = {l: l_nice for (l, l_nice) in zip(log_labels, log_labels_nice)}
-                self.LOG_last_checked = df.tail(1).index.to_pydatetime()[0]
-
+                self.LOG_last_checked = dftemp['Closest Time'].min().to_pydatetime()
+                dftemp.loc[dftemp['Closest Time'] < ts - datetime.timedelta(minutes=cfg.SENSOR_OFF_AFTER),['Temperature']] = -3000
+                self.LOG_last_checked_magnetics = dfmagnet['Closest Time'].min().to_pydatetime()
+                dfmagnet.loc[dfmagnet['Closest Time'] < ts - datetime.timedelta(minutes=cfg.SENSOR_OFF_AFTER),['Magnetic field (T)']] = -3000
+                # for c in cfg.TEMPCHANNELS
                 # make a dictionary out of the dataframe
-                self.LOG_data = df.tail(1).to_dict(orient='records')[0]
+                # self.LOG_data = dftemp.tail(1).to_dict(orient='records')[0]
+                self.LOG_data = dict(zip(cfg.TEMPCHANNELS,dftemp['Temperature']))
+                self.LOG_data.update(zip(cfg.MAGNETCHANNELS,dfmagnet['Magnetic field (T)']))
+                print(self.LOG_data)
             else:
                 logging.warning('Problem extracting fields and field labels from log file {}.'.format(self.log_file))
 
